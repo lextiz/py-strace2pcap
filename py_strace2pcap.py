@@ -5,11 +5,34 @@
     3) py_strace2pcap.py file_to_store.pcap < /tmp/straceSample
     4) wireshark file_to_store.pcap """
 
+import inspect
+
 from scapy.all import RawPcapWriter
 
 from strace_parser import StraceParser
 from strace_parser_2_packet import StraceParser2Packet
 from unix_tcp_synth import UnixTCPManager
+
+
+def _write_record(pktdump, record):
+    """Write a raw packet record, handling scapy compatibility quirks."""
+
+    if not getattr(pktdump, "header_present", False):
+        pktdump._write_header(None)
+    kwargs = {
+        "sec": record.ts_sec,
+        "usec": record.ts_usec,
+        "caplen": len(record.data),
+        "wirelen": len(record.data),
+    }
+    try:
+        pktdump.write_packet(record.data, **kwargs)
+    except TypeError:
+        # Older scapy releases expect the linktype positional argument.
+        params = inspect.signature(pktdump._write_packet).parameters
+        if "linktype" in params:
+            kwargs["linktype"] = getattr(pktdump, "linktype", None)
+        pktdump._write_packet(record.data, **kwargs)
 
 
 
@@ -70,15 +93,7 @@ if __name__ == '__main__':
             if protocol != 'UNIX-STREAM':
                 continue
             for record in unix_manager.handle_event(event):
-                if not getattr(pktdump, 'header_present', False):
-                    pktdump._write_header(record.data)
-                pktdump._write_packet(
-                    record.data,
-                    sec=record.ts_sec,
-                    usec=record.ts_usec,
-                    caplen=len(record.data),
-                    wirelen=len(record.data),
-                )
+                _write_record(pktdump, record)
             continue
         if args.unix_only:
             continue
@@ -88,12 +103,4 @@ if __name__ == '__main__':
 
     if unix_manager:
         for record in unix_manager.flush():
-            if not getattr(pktdump, 'header_present', False):
-                pktdump._write_header(record.data)
-            pktdump._write_packet(
-                record.data,
-                sec=record.ts_sec,
-                usec=record.ts_usec,
-                caplen=len(record.data),
-                wirelen=len(record.data),
-            )
+            _write_record(pktdump, record)
