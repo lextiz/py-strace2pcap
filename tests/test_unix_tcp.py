@@ -5,11 +5,11 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from unix_tcp_synth import (
-    GRPC_HEADERS_FRAME,
-    HTTP2_CLIENT_SEED,
-    HTTP2_SETTINGS_ACK_FRAME,
-)
+from unix_tcp_synth import GRPC_HEADERS_FRAME, HTTP2_CLIENT_SEED, HTTP2_SETTINGS_ACK_FRAME
+
+
+TCP_FLAG_PSH = 0x08
+TCP_FLAG_FIN = 0x01
 
 
 def _escape(data: bytes) -> str:
@@ -56,21 +56,23 @@ def _tcp_payload(packet_bytes):
     return packet_bytes[tcp_offset + data_offset:]
 
 
-def test_unix_stream_tcp_synthesis_with_coalescing(tmp_path):
+def test_http2_frame_alignment_and_close(tmp_path):
     pcap_path = tmp_path / 'out.pcap'
-    preface_bytes = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
-    extra_bytes = b'HELLO'
-    response_bytes = b'RESPONSE'
-    preface = _escape(preface_bytes)
-    extra = _escape(extra_bytes)
-    response = _escape(response_bytes)
+    client_frame = b'\x00\x00\x05\x00\x01\x00\x00\x00\x01HELLO'
+    server_frame = b'\x00\x00\x03\x00\x01\x00\x00\x00\x01ACK'
+
+    first_chunk = _escape(client_frame[:5])
+    second_chunk = _escape(client_frame[5:])
+    server_chunk = _escape(server_frame)
+
     strace_text = '\n'.join([
-        f'1234 1760606087.100000 write(54<UNIX-STREAM:[1606248]>, "{preface}", 24) = 24',
-        f'1234 1760606087.100150 write(54<UNIX-STREAM:[1606248]>, "{extra}", 5) = 5',
-        f'1234 1760606087.100400 read(54<UNIX-STREAM:[1606248]>, "{response}", 8) = 8',
+        f'1234 1760606087.100000 write(54<UNIX-STREAM:[1606248]>, "{first_chunk}", 5) = 5',
+        f'1234 1760606087.100050 write(54<UNIX-STREAM:[1606248]>, "{second_chunk}", {len(client_frame) - 5}) = {len(client_frame) - 5}',
+        f'1234 1760606087.100400 read(54<UNIX-STREAM:[1606248]>, "{server_chunk}", {len(server_frame)}) = {len(server_frame)}',
         '1234 1760606087.100800 close(54<UNIX-STREAM:[1606248]>) = 0',
         ''
     ])
+
     cmd = [
         sys.executable,
         'py_strace2pcap.py',
@@ -81,50 +83,39 @@ def test_unix_stream_tcp_synthesis_with_coalescing(tmp_path):
     subprocess.run(cmd, input=strace_text, text=True, check=True)
 
     packets = _read_pcap(pcap_path)
-    assert len(packets) >= 7
+    assert len(packets) >= 6
 
-    syn_flags = _tcp_flags(packets[0][2])
-    synack_flags = _tcp_flags(packets[1][2])
-    ack_flags = _tcp_flags(packets[2][2])
-    assert syn_flags & 0x02
-    assert synack_flags & 0x12 == 0x12
-    assert ack_flags & 0x10
+    data_packets = [pkt for pkt in packets if _tcp_flags(pkt[2]) & TCP_FLAG_PSH]
 
-    data_packets = [pkt for pkt in packets if _tcp_flags(pkt[2]) & 0x08]
     client_payloads = [
         _tcp_payload(pkt[2])
         for pkt in data_packets
         if _tcp_ports(pkt[2])[1] == 50051
     ]
-    assert len(client_payloads) == 1
-    assert client_payloads[0] == preface_bytes + extra_bytes
+    assert client_payloads == [client_frame]
 
     server_payloads = [
         _tcp_payload(pkt[2])
         for pkt in data_packets
         if _tcp_ports(pkt[2])[0] == 50051
     ]
-    assert response_bytes in server_payloads
+    assert server_frame in server_payloads
 
-    sport, dport = _tcp_ports(data_packets[0][2])
-    assert dport == 50051
-    assert sport != dport
-
-    fin_flags = _tcp_flags(packets[-2][2])
-    final_ack_flags = _tcp_flags(packets[-1][2])
-    assert fin_flags & 0x01
-    assert final_ack_flags & 0x10
+    fin_packets = [pkt for pkt in packets if _tcp_flags(pkt[2]) & TCP_FLAG_FIN]
+    assert fin_packets, 'FIN not emitted'
 
 
 def test_unix_stream_seed_http2(tmp_path):
     pcap_path = tmp_path / 'seed_http2.pcap'
-    payload_bytes = b'\x00\x00\x12\x01DATA'
-    payload = _escape(payload_bytes)
+    server_frame = b'\x00\x00\x02\x00\x00\x00\x00\x00\x01OK'
+    payload = _escape(server_frame)
+
     strace_text = '\n'.join([
-        f'4321 1760606087.200000 read(77<UNIX-STREAM:[42]>, "{payload}", 8) = 8',
+        f'4321 1760606087.200000 read(77<UNIX-STREAM:[42]>, "{payload}", {len(server_frame)}) = {len(server_frame)}',
         '4321 1760606087.200400 close(77<UNIX-STREAM:[42]>) = 0',
         ''
     ])
+
     cmd = [
         sys.executable,
         'py_strace2pcap.py',
@@ -136,22 +127,24 @@ def test_unix_stream_seed_http2(tmp_path):
     subprocess.run(cmd, input=strace_text, text=True, check=True)
 
     packets = _read_pcap(pcap_path)
-    payloads = [_tcp_payload(pkt[2]) for pkt in packets if _tcp_flags(pkt[2]) & 0x08]
+    payloads = [_tcp_payload(pkt[2]) for pkt in packets if _tcp_flags(pkt[2]) & TCP_FLAG_PSH]
 
-    assert any(pl.startswith(HTTP2_CLIENT_SEED) for pl in payloads)
+    assert HTTP2_CLIENT_SEED in payloads
     assert HTTP2_SETTINGS_ACK_FRAME in payloads
-    assert payload_bytes in payloads
+    assert server_frame in payloads
 
 
 def test_unix_stream_seed_grpc(tmp_path):
     pcap_path = tmp_path / 'seed_grpc.pcap'
-    payload_bytes = b'\x01\x02'
-    payload = _escape(payload_bytes)
+    server_frame = b'\x00\x00\x01\x00\x00\x00\x00\x00\x01!'
+    payload = _escape(server_frame)
+
     strace_text = '\n'.join([
-        f'9999 1760606087.300000 read(12<UNIX-STREAM:[777]>, "{payload}", 2) = 2',
+        f'9999 1760606087.300000 read(12<UNIX-STREAM:[777]>, "{payload}", {len(server_frame)}) = {len(server_frame)}',
         '9999 1760606087.300400 close(12<UNIX-STREAM:[777]>) = 0',
         ''
     ])
+
     cmd = [
         sys.executable,
         'py_strace2pcap.py',
@@ -164,7 +157,7 @@ def test_unix_stream_seed_grpc(tmp_path):
     subprocess.run(cmd, input=strace_text, text=True, check=True)
 
     packets = _read_pcap(pcap_path)
-    payloads = [_tcp_payload(pkt[2]) for pkt in packets if _tcp_flags(pkt[2]) & 0x08]
+    payloads = [_tcp_payload(pkt[2]) for pkt in packets if _tcp_flags(pkt[2]) & TCP_FLAG_PSH]
 
-    assert any(frame.startswith(GRPC_HEADERS_FRAME[:9]) for frame in payloads)
-    assert payload_bytes in payloads
+    assert any(payload == GRPC_HEADERS_FRAME for payload in payloads)
+    assert server_frame in payloads

@@ -56,6 +56,12 @@ FIN/ACK pairs when `close()`/`shutdown()` are observed. Disable AF_INET/6
 processing with `--no-capture-net` when you only need the UNIX side of the
 conversation.
 
+The UNIX pipeline buffers outgoing bytes until a full HTTP/2 frame is
+available so Wireshark always receives frame-aligned TCP segments. If stray
+bytes are encountered the converter logs a warning and skips ahead to the next
+plausible frame header, keeping sequence and acknowledgement numbers
+monotonic.
+
 ```console
 py_strace2pcap.py --capture-unix-socket --no-capture-net output.pcap < trace.log
 ```
