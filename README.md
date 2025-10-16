@@ -57,10 +57,10 @@ processing with `--no-capture-net` when you only need the UNIX side of the
 conversation.
 
 The UNIX pipeline buffers outgoing bytes until a full HTTP/2 frame is
-available so Wireshark always receives frame-aligned TCP segments. If stray
-bytes are encountered the converter logs a warning and skips ahead to the next
-plausible frame header, keeping sequence and acknowledgement numbers
-monotonic.
+available so Wireshark always receives frame-aligned TCP segments. Any stray
+data encountered during re-synchronisation is preserved and emitted as an
+"opaque" TCP payload before the next aligned frame, and the final
+`close()`/EOF flush guarantees that no bytes are dropped.
 
 ```console
 py_strace2pcap.py --capture-unix-socket --no-capture-net output.pcap < trace.log
@@ -75,6 +75,9 @@ capture starts mid-stream:
 * `--seed-grpc` (requires `--seed-http2`) adds a small HEADERS frame on stream 1
   with gRPC-friendly pseudo-headers so the gRPC dissector activates even when
   the real request headers were not captured.
+
+All synthesised TCP segments include fully-populated IPv4 and TCP checksums.
+Pass `--no-checksum` if you need the legacy zeroed checksum behaviour.
 
 ## Link-layer options
 

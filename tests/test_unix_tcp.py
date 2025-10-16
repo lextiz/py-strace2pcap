@@ -56,6 +56,12 @@ def _tcp_payload(packet_bytes):
     return packet_bytes[tcp_offset + data_offset:]
 
 
+def _tcp_checksum(packet_bytes):
+    ihl = (packet_bytes[14] & 0x0F) * 4
+    tcp_offset = 14 + ihl
+    return struct.unpack('!H', packet_bytes[tcp_offset + 16:tcp_offset + 18])[0]
+
+
 def test_http2_frame_alignment_and_close(tmp_path):
     pcap_path = tmp_path / 'out.pcap'
     client_frame = b'\x00\x00\x05\x00\x01\x00\x00\x00\x01HELLO'
@@ -93,6 +99,7 @@ def test_http2_frame_alignment_and_close(tmp_path):
         if _tcp_ports(pkt[2])[1] == 50051
     ]
     assert client_payloads == [client_frame]
+    assert _tcp_checksum(data_packets[0][2]) != 0
 
     server_payloads = [
         _tcp_payload(pkt[2])
@@ -161,3 +168,55 @@ def test_unix_stream_seed_grpc(tmp_path):
 
     assert any(payload == GRPC_HEADERS_FRAME for payload in payloads)
     assert server_frame in payloads
+
+
+def test_residual_bytes_flushed_on_close(tmp_path):
+    pcap_path = tmp_path / 'residual.pcap'
+    payload = b'PARTIAL'
+    escaped = _escape(payload)
+
+    strace_text = '\n'.join([
+        f'5555 1760606087.400000 write(22<UNIX-STREAM:[888]>, "{escaped}", {len(payload)}) = {len(payload)}',
+        '5555 1760606087.400400 close(22<UNIX-STREAM:[888]>) = 0',
+        ''
+    ])
+
+    cmd = [
+        sys.executable,
+        'py_strace2pcap.py',
+        '--capture-unix-socket',
+        '--no-capture-net',
+        str(pcap_path),
+    ]
+    subprocess.run(cmd, input=strace_text, text=True, check=True)
+
+    packets = _read_pcap(pcap_path)
+    payloads = [_tcp_payload(pkt[2]) for pkt in packets if _tcp_flags(pkt[2]) & TCP_FLAG_PSH]
+    assert payload in payloads
+
+
+def test_no_checksum_flag(tmp_path):
+    pcap_path = tmp_path / 'no_checksum.pcap'
+    frame = b'\x00\x00\x01\x00\x01\x00\x00\x00\x01A'
+    escaped = _escape(frame)
+
+    strace_text = '\n'.join([
+        f'1111 1760606087.500000 write(5<UNIX-STREAM:[111]>, "{escaped}", {len(frame)}) = {len(frame)}',
+        '1111 1760606087.500400 close(5<UNIX-STREAM:[111]>) = 0',
+        ''
+    ])
+
+    cmd = [
+        sys.executable,
+        'py_strace2pcap.py',
+        '--capture-unix-socket',
+        '--no-capture-net',
+        '--no-checksum',
+        str(pcap_path),
+    ]
+    subprocess.run(cmd, input=strace_text, text=True, check=True)
+
+    packets = _read_pcap(pcap_path)
+    data_packets = [pkt for pkt in packets if _tcp_flags(pkt[2]) & TCP_FLAG_PSH]
+    assert data_packets, 'expected data packet'
+    assert _tcp_checksum(data_packets[0][2]) == 0

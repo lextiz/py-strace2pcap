@@ -94,6 +94,12 @@ if __name__ == '__main__':
         default=False,
         help='Seed UNIX TCP flows with a minimal gRPC HEADERS frame (implies HTTP/2 seeding)',
     )
+    parser.add_argument(
+        '--no-checksum',
+        action='store_true',
+        default=False,
+        help='Disable TCP checksum calculation for synthetic UNIX flows',
+    )
 
     args = parser.parse_args()
 
@@ -112,6 +118,7 @@ if __name__ == '__main__':
         unix_manager = UnixTCPManager(
             seed_http2=args.seed_http2,
             seed_grpc=args.seed_grpc,
+            no_checksum=args.no_checksum,
         )
 
     for event in _iterate_events(strace_parser, sys.stdin):

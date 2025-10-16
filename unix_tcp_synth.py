@@ -6,7 +6,7 @@ import ipaddress
 import logging
 import struct
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 WRITE_SYSCALLS = {"write", "sendmsg", "sendto"}
 READ_SYSCALLS = {"read", "recvmsg", "recvfrom"}
@@ -20,6 +20,7 @@ TCP_FLAG_ACK = 0x10
 
 HANDSHAKE_DELTA = 0.0001
 MAX_HTTP2_FRAME_SIZE = (1 << 24) - 1
+VALID_STREAM_ZERO_TYPES = {0x4, 0x6, 0x7, 0x8}
 TIMESTAMP_EPSILON = 1e-6
 
 HTTP2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
@@ -91,6 +92,7 @@ class UnixTCPManager:
         dst_port: int = 50051,
         seed_http2: bool = False,
         seed_grpc: bool = False,
+        no_checksum: bool = False,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._flows_by_inode: Dict[int, Flow] = {}
@@ -103,6 +105,7 @@ class UnixTCPManager:
         self._ip_id = 0
         self._seed_http2 = seed_http2
         self._seed_grpc = seed_grpc
+        self._no_checksum = no_checksum
         self._logger = logger or logging.getLogger(__name__)
 
     # ------------------------------------------------------------------
@@ -269,78 +272,88 @@ class UnixTCPManager:
         buf = flow.buffers[side]
         if not buf:
             return packets
-        frames: List[bytes] = []
         start_ts = flow.buffer_start[side] or flow.last_event_ts[side] or 0.0
-        while True:
+        outputs: List[Tuple[bytes, bool, Optional[str]]] = []
+
+        while buf:
             if side == "A" and not flow.preface_done and len(buf) >= len(HTTP2_PREFACE) and buf.startswith(HTTP2_PREFACE):
-                frames.append(bytes(buf[: len(HTTP2_PREFACE)]))
+                outputs.append((bytes(buf[: len(HTTP2_PREFACE)]), False, "preface"))
                 del buf[: len(HTTP2_PREFACE)]
                 flow.preface_done = True
                 continue
+
             if len(buf) < 9:
                 break
-            length = int.from_bytes(buf[:3], "big")
+
+            header = bytes(buf[:9])
+            parsed = _parse_http2_header(header)
+            if parsed is None:
+                offset = self._find_alignment(buf)
+                if offset is None:
+                    break
+                chunk = bytes(buf[:offset])
+                del buf[:offset]
+                if chunk:
+                    self._logger.warning(
+                        "unix flow %s emitted %d opaque bytes while seeking HTTP/2 resync",
+                        flow.inode,
+                        len(chunk),
+                    )
+                    outputs.append((chunk, False, "opaque"))
+                continue
+
+            length, _, _, _ = parsed
             total = length + 9
-            if length > MAX_HTTP2_FRAME_SIZE:
-                self._logger.warning(
-                    "unix flow %s invalid HTTP/2 length %d; attempting resync", flow.inode, length
-                )
-                if not self._resync_buffer(flow, side):
-                    buf.clear()
-                continue
-            if total <= len(buf):
-                frames.append(bytes(buf[:total]))
-                del buf[:total]
-                continue
-            if final and not frames and self._resync_buffer(flow, side):
-                start_ts = flow.buffer_start[side] or start_ts
-                continue
-            break
+            if total > len(buf):
+                break
+
+            frame = bytes(buf[:total])
+            del buf[:total]
+            outputs.append((frame, True, None))
+
         if final and buf:
-            if len(buf) < 9:
-                self._logger.warning(
-                    "unix flow %s dropping %d dangling bytes", flow.inode, len(buf)
-                )
-                buf.clear()
-            else:
-                self._logger.warning(
-                    "unix flow %s unable to realign residual buffer of %d bytes", flow.inode, len(buf)
-                )
-                buf.clear()
-        if not frames:
+            outputs.append((bytes(buf), False, "final"))
+            buf.clear()
+
+        if not outputs:
             return packets
-        for idx, frame in enumerate(frames):
+
+        for idx, (payload, is_frame, reason) in enumerate(outputs):
             ts = max(start_ts + idx * TIMESTAMP_EPSILON, 0.0)
-            packets.extend(self._emit_frame(flow, side, frame, ts))
+            packets.extend(
+                self._emit_payload(flow, side, payload, ts, is_frame=is_frame, reason=reason)
+            )
+
         flow.buffer_start[side] = flow.last_event_ts[side] if buf else None
         return packets
 
-    def _resync_buffer(self, flow: Flow, side: str) -> bool:
-        buf = flow.buffers[side]
-        for offset in range(1, max(len(buf) - 8, 1)):
-            candidate = buf[offset:]
+    def _find_alignment(self, buf: bytearray) -> Optional[int]:
+        for offset in range(1, len(buf)):
+            candidate = buf[offset:offset + 9]
             if len(candidate) < 9:
-                break
-            length = int.from_bytes(candidate[:3], "big")
-            total = length + 9
-            if length > MAX_HTTP2_FRAME_SIZE:
-                continue
-            if total <= len(candidate):
-                self._logger.warning(
-                    "unix flow %s realigning %s buffer by %d bytes", flow.inode, side, offset
-                )
-                del buf[:offset]
-                flow.buffer_start[side] = flow.last_event_ts[side]
-                return True
-        return False
+                return None
+            if _parse_http2_header(bytes(candidate)) is not None:
+                return offset
+        return None
 
-    def _emit_frame(self, flow: Flow, side: str, frame: bytes, ts: float) -> List[PacketRecord]:
+    def _emit_payload(
+        self,
+        flow: Flow,
+        side: str,
+        payload: bytes,
+        ts: float,
+        *,
+        is_frame: bool,
+        reason: Optional[str],
+    ) -> List[PacketRecord]:
         packets: List[PacketRecord] = []
         packets.extend(self._emit_handshake(flow, ts))
         packets.extend(self._maybe_seed(flow, ts))
         seq = flow.next_seq[side]
         peer = Flow.opposite(side)
         ack = flow.next_seq[peer]
+        if not payload:
+            return packets
         packets.append(
             self._build_record(
                 flow,
@@ -348,11 +361,26 @@ class UnixTCPManager:
                 seq,
                 ack,
                 TCP_FLAG_PSH | TCP_FLAG_ACK,
-                frame,
+                payload,
                 ts,
             )
         )
-        flow.next_seq[side] += len(frame)
+        flow.next_seq[side] += len(payload)
+        if not is_frame:
+            if reason == "preface":
+                self._logger.info(
+                    "unix flow %s forwarded HTTP/2 client preface (%d bytes)",
+                    flow.inode,
+                    len(payload),
+                )
+            else:
+                self._logger.warning(
+                    "unix flow %s flushed %d non-frame bytes from side %s (%s)",
+                    flow.inode,
+                    len(payload),
+                    side,
+                    reason or "opaque",
+                )
         return packets
 
     def _emit_handshake(self, flow: Flow, ts: float) -> List[PacketRecord]:
@@ -564,8 +592,6 @@ class UnixTCPManager:
         data_offset = 5 << 12
         window = 65535
         urgent = 0
-        # Leave the checksum at zero to avoid needing to fragment very large HTTP/2
-        # frames. Wireshark will happily dissect the traffic even without it.
         checksum = 0
         header = struct.pack(
             "!HHIIHHHH",
@@ -578,6 +604,19 @@ class UnixTCPManager:
             checksum,
             urgent,
         )
+        if not self._no_checksum:
+            checksum = _tcp_checksum(src_ip, dst_ip, header, payload)
+            header = struct.pack(
+                "!HHIIHHHH",
+                src_port,
+                dst_port,
+                seq,
+                ack,
+                data_offset | flags,
+                window,
+                checksum,
+                urgent,
+            )
         return header, len(header) + len(payload)
 
     def _split_ts(self, ts: float) -> Tuple[int, int]:
@@ -600,3 +639,31 @@ def _checksum(data: bytes) -> int:
     while acc >> 16:
         acc = (acc & 0xFFFF) + (acc >> 16)
     return (~acc) & 0xFFFF
+
+
+def _parse_http2_header(header: bytes) -> Optional[Tuple[int, int, int, int]]:
+    if len(header) < 9:
+        return None
+    length = int.from_bytes(header[:3], "big")
+    if length > MAX_HTTP2_FRAME_SIZE:
+        return None
+    frame_type = header[3]
+    if frame_type > 0x9:
+        return None
+    flags = header[4]
+    stream_raw = int.from_bytes(header[5:9], "big")
+    if stream_raw & 0x80000000:
+        return None
+    stream_id = stream_raw & 0x7FFFFFFF
+    if stream_id == 0 and frame_type not in VALID_STREAM_ZERO_TYPES:
+        return None
+    return length, frame_type, flags, stream_id
+
+
+def _tcp_checksum(src_ip: str, dst_ip: str, header: bytes, payload: bytes) -> int:
+    pseudo = (
+        ipaddress.IPv4Address(src_ip).packed
+        + ipaddress.IPv4Address(dst_ip).packed
+        + struct.pack("!BBH", 0, 6, len(header) + len(payload))
+    )
+    return _checksum(pseudo + header + payload)
