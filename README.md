@@ -44,6 +44,38 @@ start conversion from strace to pcap
 py_strace2pcap.py file_to_store.pcap < /tmp/straceSample
 ```
 
+## UNIX domain socket synthesis
+
+`py_strace2pcap.py` can synthesise TCP/UDP traffic for AF\_UNIX sockets that appear in
+the strace log. When `--unix-to-tcp` (default) is enabled the converter creates
+deterministic IPv4 endpoints and emits a TCP 3-way handshake followed by PSH/ACK
+segments for each observed `write()`/`read()` pair. UNIX datagram activity is
+mapped to UDP packets. This allows Wireshark to decode higher-layer plaintext
+protocols such as HTTP/2 or gRPC even when the underlying transport was a UNIX
+socket.
+
+The synthetic addressing can be customised:
+
+```console
+py_strace2pcap.py --unix-base-ip-a 10.10.0.1 --unix-base-ip-b 10.10.1.1 \
+  --unix-base-sport 35000 --unix-base-dport 45000 output.pcap < trace.log
+```
+
+Set `--no-unix-to-tcp` to disable synthesis and preserve the previous behaviour.
+
+## Link-layer options
+
+The default link-layer for new PCAP files is `raw` (DLT\_RAW) so that packets
+start with the IP header. Use `--linktype ether` to retain the historical
+Ethernet + 802.1q metadata encoding for AF\_INET/AF\_INET6 sockets.
+
+```console
+py_strace2pcap.py --linktype ether capture.pcap < trace.log
+```
+
+TLS-encrypted payloads remain opaque because the plaintext is not available in
+the strace logs.
+
 # play with your pcap
 read network traffic from strace with wireshark, tshark, or tcpdump
 ```console
