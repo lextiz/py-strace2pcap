@@ -46,35 +46,37 @@ py_strace2pcap.py file_to_store.pcap < /tmp/straceSample
 
 ## UNIX domain sockets
 
-`py_strace2pcap.py` can export AF\_UNIX activity without pretending it was TCP.
-Pass `--unix-only` to generate a PCAP whose link-layer is `DLT_USER0` and whose
-frames contain `UXSO` records. Each record mirrors a single `read()`/`write()`
-operation observed in the strace log and stores the PID, FD, inode, direction,
-optional path metadata, and the raw payload bytes.
+`py_strace2pcap.py` can now synthesise realistic TCP/IP flows for UNIX stream
+sockets. Each inode is mapped to a deterministic Ethernet/IP/TCP tuple so that
+Wireshark automatically decodes higher-level protocols such as HTTP/2 and
+gRPC. The TCP handshake is emitted once per flow, payloads are replayed in
+order with PSH/ACK flags, and `close()`/`shutdown()` calls produce FIN/ACK
+teardowns when observed.
+
+The feature is enabled by default. Use `--no-unix-to-tcp` to suppress UNIX
+packets entirely and preserve the legacy behaviour, or `--unix-only` to emit
+just the synthesised UNIX traffic. When UNIX TCP synthesis is active the PCAP
+link-layer is forced to Ethernet (DLT_EN10MB) so both AF_UNIX and AF_INET
+traffic can coexist in the same capture.
 
 ```console
 py_strace2pcap.py --unix-only output.pcap < trace.log
 ```
 
-Set `--no-include-unix-paths` to omit `sun_path` strings from the records if
-they contain sensitive data. The default is to embed both the local path and
-peer path (when present) before the captured payload.
-
-Wireshark, tshark, or tcpdump will treat the resulting PCAP as opaque USER0
-frames unless the included dissector is installed. Copy
-`extras/wireshark/uxso.lua` into your Wireshark plugins directory and restart
-the application to see structured UXSO dissections and payload bytes. Without
-`--unix-only` AF\_UNIX events are skipped and only AF\_INET/AF\_INET6 packets are
-emitted, preserving the traditional behaviour of the tool.
+Each stream uses source IPs in the `10.0.0.0/24` range and destination IPs in
+`10.0.1.0/24`, with client ports derived from the inode number and a default
+server port of 50051 to hint gRPC dissectors.
 
 ## Link-layer options
 
-The default link-layer for new PCAP files is `raw` (DLT\_RAW) so that packets
-start with the IP header. Use `--linktype ether` to retain the historical
-Ethernet + 802.1q metadata encoding for AF\_INET/AF\_INET6 sockets.
+When UNIX TCP synthesis is enabled the converter always writes Ethernet
+frames (DLT_EN10MB) so both UNIX and INET traffic share the same link-layer.
+Disable the feature with `--no-unix-to-tcp` to regain the original behaviour,
+where the default link-layer is `raw` (DLT_RAW) and `--linktype ether` opt-in
+restores the Ethernet + 802.1Q encoding for classic AF_INET/AF_INET6 sockets.
 
 ```console
-py_strace2pcap.py --linktype ether capture.pcap < trace.log
+py_strace2pcap.py --no-unix-to-tcp --linktype ether capture.pcap < trace.log
 ```
 
 TLS-encrypted payloads remain opaque because the plaintext is not available in

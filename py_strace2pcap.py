@@ -5,12 +5,24 @@
     3) py_strace2pcap.py file_to_store.pcap < /tmp/straceSample
     4) wireshark file_to_store.pcap """
 
-
 from scapy.all import RawPcapWriter
+
 from strace_parser import StraceParser
 from strace_parser_2_packet import StraceParser2Packet
-from process_cascade import ProcessCascade
-from unix_user0 import UnixUser0Emitter
+from unix_tcp_synth import UnixTCPManager
+
+
+
+
+def _iterate_events(strace_parser, stream):
+    for line in stream:
+        event = strace_parser.process(line)
+        while event:
+            yield event
+            if strace_parser.has_split_cache():
+                event = strace_parser.get_split_cache()
+            else:
+                break
 
 
 if __name__ == '__main__':
@@ -20,27 +32,68 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Convert strace output to PCAP')
     parser.add_argument('pcap_filename')
     parser.add_argument('--unix-only', action='store_true',
-                        help='Emit only AF_UNIX events using USER0 frames (DLT 147)')
-    parser.add_argument('--include-unix-paths', dest='include_unix_paths',
-                        action='store_true', help='Include AF_UNIX path metadata')
-    parser.add_argument('--no-include-unix-paths', dest='include_unix_paths',
-                        action='store_false', help='Omit AF_UNIX path metadata')
-    parser.set_defaults(include_unix_paths=True)
+                        help='Emit only AF_UNIX events synthesised as TCP')
+    parser.add_argument('--unix-to-tcp', dest='unix_to_tcp', action='store_true',
+                        help='Synthesize TCP flows for UNIX stream sockets (default)')
+    parser.add_argument('--no-unix-to-tcp', dest='unix_to_tcp', action='store_false',
+                        help='Disable UNIX stream TCP synthesis')
+    parser.set_defaults(unix_to_tcp=True)
     parser.add_argument('--linktype', choices=['raw', 'ether'], default='raw',
                         help='PCAP link-layer type for AF_INET/AF_INET6 packets')
 
     args = parser.parse_args()
 
-    if args.unix_only:
-        pktdump = RawPcapWriter(args.pcap_filename, linktype=147)
-        packet_processor = lambda: UnixUser0Emitter(
-            include_paths=args.include_unix_paths)
+    if args.unix_only and not args.unix_to_tcp:
+        parser.error('--unix-only requires UNIX TCP synthesis to be enabled')
+
+    unix_tcp_enabled = args.unix_to_tcp
+    if args.unix_only or unix_tcp_enabled:
+        linktype_value = 1
+        inet_linktype = 'ether'
     else:
         linktype_value = 101 if args.linktype == 'raw' else 1
-        pktdump = RawPcapWriter(args.pcap_filename, linktype=linktype_value)
-        packet_processor = lambda: StraceParser2Packet(linktype=args.linktype)
+        inet_linktype = args.linktype
 
-    for packet in ProcessCascade(
-            packet_processor, ProcessCascade(StraceParser, sys.stdin)):
+    pktdump = RawPcapWriter(args.pcap_filename, linktype=linktype_value)
+
+    strace_parser = StraceParser()
+    inet_packetizer = None if args.unix_only else StraceParser2Packet(linktype=inet_linktype)
+    unix_manager = UnixTCPManager() if unix_tcp_enabled else None
+
+    for event in _iterate_events(strace_parser, sys.stdin):
+        if not event:
+            continue
+        protocol = event.get('protocol')
+        if protocol and protocol.startswith('UNIX'):
+            if not unix_tcp_enabled:
+                continue
+            if protocol != 'UNIX-STREAM':
+                continue
+            for record in unix_manager.handle_event(event):
+                if not getattr(pktdump, 'header_present', False):
+                    pktdump._write_header(record.data)
+                pktdump._write_packet(
+                    record.data,
+                    sec=record.ts_sec,
+                    usec=record.ts_usec,
+                    caplen=len(record.data),
+                    wirelen=len(record.data),
+                )
+            continue
+        if args.unix_only:
+            continue
+        packet = inet_packetizer.process(event)
         if packet:
             pktdump.write(packet)
+
+    if unix_manager:
+        for record in unix_manager.flush():
+            if not getattr(pktdump, 'header_present', False):
+                pktdump._write_header(record.data)
+            pktdump._write_packet(
+                record.data,
+                sec=record.ts_sec,
+                usec=record.ts_usec,
+                caplen=len(record.data),
+                wirelen=len(record.data),
+            )
