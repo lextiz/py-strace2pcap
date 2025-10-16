@@ -20,6 +20,10 @@ uxso_proto.fields = { f_magic, f_version, f_sock_type, f_direction, f_flags,
     f_pid, f_fd, f_inode, f_stream_id, f_payload_len, f_path, f_peer_path,
     f_payload }
 
+local function flag_set(flags, mask)
+    return math.floor(flags / mask) % 2 == 1
+end
+
 function uxso_proto.dissector(buffer, pinfo, tree)
     if buffer:len() < 24 then return end
     local magic = buffer(0, 4):string()
@@ -43,12 +47,12 @@ function uxso_proto.dissector(buffer, pinfo, tree)
 
     local cursor = 28
     local flags = buffer(7, 1):uint()
-    if bit32.band(flags, 0x01) ~= 0 then
+    if flag_set(flags, 0x01) then
         local zero = buffer:range(cursor):stringz():len()
         subtree:add(f_path, buffer(cursor, zero))
         cursor = cursor + zero + 1
     end
-    if bit32.band(flags, 0x02) ~= 0 then
+    if flag_set(flags, 0x02) then
         local zero = buffer:range(cursor):stringz():len()
         subtree:add(f_peer_path, buffer(cursor, zero))
         cursor = cursor + zero + 1
