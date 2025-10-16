@@ -19,7 +19,7 @@ TCP_FLAG_PSH = 0x08
 TCP_FLAG_ACK = 0x10
 
 HANDSHAKE_DELTA = 0.0001
-MAX_HTTP2_FRAME_SIZE = 1 << 20
+MAX_HTTP2_FRAME_SIZE = (1 << 24) - 1
 TIMESTAMP_EPSILON = 1e-6
 
 HTTP2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
@@ -563,21 +563,10 @@ class UnixTCPManager:
     ) -> Tuple[bytes, int]:
         data_offset = 5 << 12
         window = 65535
-        checksum = 0
         urgent = 0
-        header = struct.pack(
-            "!HHIIHHHH",
-            src_port,
-            dst_port,
-            seq,
-            ack,
-            data_offset | flags,
-            window,
-            checksum,
-            urgent,
-        )
-        pseudo = _pseudo_header(src_ip, dst_ip, len(header) + len(payload))
-        checksum = _checksum(pseudo + header + payload)
+        # Leave the checksum at zero to avoid needing to fragment very large HTTP/2
+        # frames. Wireshark will happily dissect the traffic even without it.
+        checksum = 0
         header = struct.pack(
             "!HHIIHHHH",
             src_port,
@@ -600,14 +589,6 @@ class UnixTCPManager:
             ts_sec += 1
             ts_usec -= 1_000_000
         return ts_sec, ts_usec
-
-
-def _pseudo_header(src_ip: str, dst_ip: str, length: int) -> bytes:
-    return (
-        ipaddress.IPv4Address(src_ip).packed
-        + ipaddress.IPv4Address(dst_ip).packed
-        + struct.pack("!BBH", 0, 6, length)
-    )
 
 
 def _checksum(data: bytes) -> int:
