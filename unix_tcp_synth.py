@@ -22,6 +22,9 @@ HANDSHAKE_DELTA = 0.0001
 MAX_HTTP2_FRAME_SIZE = (1 << 24) - 1
 VALID_STREAM_ZERO_TYPES = {0x4, 0x6, 0x7, 0x8}
 TIMESTAMP_EPSILON = 1e-6
+# Maximum TCP payload that fits into a single IPv4 packet (65,535 total bytes minus
+# a 20-byte IPv4 header and a 20-byte TCP header).
+MAX_TCP_PAYLOAD = 65535 - 20 - 20
 
 HTTP2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 HTTP2_CLIENT_SETTINGS_FRAME = b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
@@ -349,23 +352,36 @@ class UnixTCPManager:
         packets: List[PacketRecord] = []
         packets.extend(self._emit_handshake(flow, ts))
         packets.extend(self._maybe_seed(flow, ts))
-        seq = flow.next_seq[side]
+        seq_start = flow.next_seq[side]
         peer = Flow.opposite(side)
         ack = flow.next_seq[peer]
         if not payload:
             return packets
-        packets.append(
-            self._build_record(
-                flow,
-                side,
-                seq,
-                ack,
-                TCP_FLAG_PSH | TCP_FLAG_ACK,
-                payload,
-                ts,
+
+        total_len = len(payload)
+        chunk_packets: List[PacketRecord] = []
+        offset = 0
+        chunk_idx = 0
+        while offset < total_len:
+            chunk = payload[offset : offset + MAX_TCP_PAYLOAD]
+            chunk_seq = seq_start + offset
+            chunk_ts = max(ts + chunk_idx * TIMESTAMP_EPSILON, 0.0)
+            chunk_packets.append(
+                self._build_record(
+                    flow,
+                    side,
+                    chunk_seq,
+                    ack,
+                    TCP_FLAG_PSH | TCP_FLAG_ACK,
+                    chunk,
+                    chunk_ts,
+                )
             )
-        )
-        flow.next_seq[side] += len(payload)
+            offset += len(chunk)
+            chunk_idx += 1
+
+        packets.extend(chunk_packets)
+        flow.next_seq[side] += total_len
         if not is_frame:
             if reason == "preface":
                 self._logger.info(
