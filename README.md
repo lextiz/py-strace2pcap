@@ -46,38 +46,35 @@ py_strace2pcap.py file_to_store.pcap < /tmp/straceSample
 
 ## UNIX domain sockets
 
-`py_strace2pcap.py` can now synthesise realistic TCP/IP flows for UNIX stream
-sockets. Each inode is mapped to a deterministic Ethernet/IP/TCP tuple so that
-Wireshark automatically decodes higher-level protocols such as HTTP/2 and
-gRPC. The TCP handshake is emitted once per flow, payloads are replayed in
-order with PSH/ACK flags, and `close()`/`shutdown()` calls produce FIN/ACK
-teardowns when observed.
-
-The feature is enabled by default. Use `--no-unix-to-tcp` to suppress UNIX
-packets entirely and preserve the legacy behaviour, or `--unix-only` to emit
-just the synthesised UNIX traffic. When UNIX TCP synthesis is active the PCAP
-link-layer is forced to Ethernet (DLT_EN10MB) so both AF_UNIX and AF_INET
-traffic can coexist in the same capture.
+By default the converter emits the original AF_INET/AF_INET6 packets only.
+Pass `--capture-unix-socket` to synthesise realistic Ethernet/IP/TCP flows for
+UNIX stream sockets. Each inode is mapped to a deterministic 5-tuple
+(`10.0.0.X:ephemeral → 10.0.1.X:50051`) so Wireshark can decode HTTP/2 and
+gRPC traffic automatically. The synthesiser emits a three-way handshake once
+per flow, coalesces adjacent writes from the same direction, and generates
+FIN/ACK pairs when `close()`/`shutdown()` are observed. Disable AF_INET/6
+processing with `--no-capture-net` when you only need the UNIX side of the
+conversation.
 
 ```console
-py_strace2pcap.py --unix-only output.pcap < trace.log
+py_strace2pcap.py --capture-unix-socket --no-capture-net output.pcap < trace.log
 ```
 
-Each stream uses source IPs in the `10.0.0.0/24` range and destination IPs in
-`10.0.1.0/24`, with client ports derived from the inode number and a default
-server port of 50051 to hint gRPC dissectors.
+Two optional seeders help Wireshark recover missing protocol prefaces when the
+capture starts mid-stream:
+
+* `--seed-http2` injects the HTTP/2 client preface and minimal SETTINGS/ACK
+  frames before the first payload so Wireshark enables the HTTP/2 dissector
+  automatically.
+* `--seed-grpc` (requires `--seed-http2`) adds a small HEADERS frame on stream 1
+  with gRPC-friendly pseudo-headers so the gRPC dissector activates even when
+  the real request headers were not captured.
 
 ## Link-layer options
 
-When UNIX TCP synthesis is enabled the converter always writes Ethernet
-frames (DLT_EN10MB) so both UNIX and INET traffic share the same link-layer.
-Disable the feature with `--no-unix-to-tcp` to regain the original behaviour,
-where the default link-layer is `raw` (DLT_RAW) and `--linktype ether` opt-in
-restores the Ethernet + 802.1Q encoding for classic AF_INET/AF_INET6 sockets.
-
-```console
-py_strace2pcap.py --no-unix-to-tcp --linktype ether capture.pcap < trace.log
-```
+When UNIX TCP synthesis is enabled the converter always writes Ethernet frames
+(DLT_EN10MB) so both UNIX and INET traffic share the same link-layer without
+needing extra flags.
 
 TLS-encrypted payloads remain opaque because the plaintext is not available in
 the strace logs.

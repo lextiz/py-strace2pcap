@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import math
 import struct
 from dataclasses import dataclass, field
@@ -21,6 +22,17 @@ TCP_FLAG_RST = 0x04
 TCP_FLAG_PSH = 0x08
 TCP_FLAG_ACK = 0x10
 
+COALESCE_WINDOW = 0.0002
+
+HTTP2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+HTTP2_CLIENT_SETTINGS_FRAME = b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
+HTTP2_SETTINGS_ACK_FRAME = b"\x00\x00\x00\x04\x01\x00\x00\x00\x00"
+HTTP2_CLIENT_SEED = HTTP2_PREFACE + HTTP2_CLIENT_SETTINGS_FRAME
+GRPC_HEADERS_BLOCK = bytes.fromhex(
+    "83449462ba0642ce7a242d8bee2d9dcc42b1a0a99cf27f5f8b1d75d0620d263d4c4d65644082497f864d833505b11f"
+)
+GRPC_HEADERS_FRAME = b"\x00\x00\x2f\x01\x04\x00\x00\x00\x01" + GRPC_HEADERS_BLOCK
+
 
 @dataclass
 class PacketRecord:
@@ -29,6 +41,14 @@ class PacketRecord:
     ts_sec: int
     ts_usec: int
     data: bytes
+
+
+def _empty_bytearray_dict() -> Dict[str, bytearray]:
+    return {"A": bytearray(), "B": bytearray()}
+
+
+def _empty_float_dict() -> Dict[str, Optional[float]]:
+    return {"A": None, "B": None}
 
 
 @dataclass
@@ -52,6 +72,11 @@ class Flow:
     handshake_done: bool = False
     owners: Dict[Tuple[int, int, int], str] = field(default_factory=dict)
     fin_sent: set = field(default_factory=set)
+    pending_data: Dict[str, bytearray] = field(default_factory=_empty_bytearray_dict)
+    pending_start: Dict[str, Optional[float]] = field(default_factory=_empty_float_dict)
+    last_event_ts: Dict[str, Optional[float]] = field(default_factory=_empty_float_dict)
+    seed_http2_emitted: bool = False
+    seed_grpc_emitted: bool = False
 
     def owner_side(self, owner_key: Tuple[int, int, int]) -> str:
         """Return the flow side ("A" or "B") for a pid/fd/session tuple."""
@@ -64,7 +89,6 @@ class Flow:
         elif "B" not in assigned:
             side = "B"
         else:
-            # Default to side A when more than two owners appear.
             side = "A"
         self.owners[owner_key] = side
         return side
@@ -84,6 +108,10 @@ class UnixTCPManager:
         base_dst_ip: str = "10.0.1.0",
         base_sport: int = 30000,
         dst_port: int = 50051,
+        coalesce_window: float = COALESCE_WINDOW,
+        seed_http2: bool = False,
+        seed_grpc: bool = False,
+        logger: Optional[logging.Logger] = None,
     ) -> None:
         self._flows: Dict[Tuple[str, int, int, int], Flow] = {}
         self._flows_by_inode: Dict[int, Flow] = {}
@@ -93,13 +121,15 @@ class UnixTCPManager:
         self._dst_port = dst_port
         self._next_index = 0
         self._ip_id = 0
+        self._coalesce_window = coalesce_window
+        self._seed_http2 = seed_http2
+        self._seed_grpc = seed_grpc
+        self._logger = logger or logging.getLogger(__name__)
 
     def handle_event(self, event) -> List[PacketRecord]:
         """Process a parsed strace event and return packets to emit."""
 
-        if not event:
-            return []
-        if event.get("protocol") != "UNIX-STREAM":
+        if not event or event.get("protocol") != "UNIX-STREAM":
             return []
         syscall = event.get("syscall") or ""
         time_float = float(event.get("time", 0.0))
@@ -112,10 +142,10 @@ class UnixTCPManager:
         side = flow.owner_side(owner_key)
 
         if syscall in WRITE_SYSCALLS:
-            return self._handle_payload(flow, side, event, time_float)
+            return self._queue_payload(flow, side, event, time_float)
         if syscall in READ_SYSCALLS:
             sender = Flow.opposite(side)
-            return self._handle_payload(flow, sender, event, time_float)
+            return self._queue_payload(flow, sender, event, time_float)
         if syscall in STATE_SYSCALLS:
             return self._handle_state(flow, side, syscall, event, time_float)
         return []
@@ -123,7 +153,14 @@ class UnixTCPManager:
     def flush(self) -> Iterable[PacketRecord]:
         """Return packets that should be emitted when processing ends."""
 
-        return []
+        packets: List[PacketRecord] = []
+        seen: set[int] = set()
+        for flow in list(self._flows_by_inode.values()) + list(self._flows.values()):
+            if id(flow) in seen:
+                continue
+            seen.add(id(flow))
+            packets.extend(self._flush_all(flow, flow.pending_start["A"] or flow.pending_start["B"] or 0.0))
+        return packets
 
     # Internal helpers -------------------------------------------------
 
@@ -180,31 +217,22 @@ class UnixTCPManager:
         mac_int = base + index
         return mac_int.to_bytes(6, "big")
 
-    def _handle_payload(
-        self, flow: Flow, sender: str, event, time_float: float
-    ) -> List[PacketRecord]:
+    def _queue_payload(self, flow: Flow, sender: str, event, time_float: float) -> List[PacketRecord]:
         result = event.get("result")
         payload: bytes = event.get("payload") or b""
-        if not isinstance(result, int) or result <= 0 or not payload:
+        if not isinstance(result, int) or result <= 0 or not isinstance(payload, (bytes, bytearray)):
             return []
-        data = payload[:result]
+        data = bytes(payload[:result])
+        if not data:
+            return []
         packets: List[PacketRecord] = []
-        if not flow.handshake_done:
-            packets.extend(self._emit_handshake(flow, time_float))
-        seq, ack = self._seq_ack_for(flow, sender)
-        tcp_flags = TCP_FLAG_PSH | TCP_FLAG_ACK
-        packets.append(
-            self._build_record(
-                flow,
-                sender,
-                seq,
-                ack,
-                tcp_flags,
-                data,
-                time_float,
-            )
-        )
-        self._advance_after_payload(flow, sender, len(data))
+        packets.extend(self._flush_buffer(flow, Flow.opposite(sender), time_float))
+        packets.extend(self._flush_if_timeout(flow, sender, time_float))
+        buf = flow.pending_data[sender]
+        if not buf:
+            flow.pending_start[sender] = time_float
+        buf.extend(data)
+        flow.last_event_ts[sender] = time_float
         return packets
 
     def _handle_state(
@@ -217,12 +245,9 @@ class UnixTCPManager:
     ) -> List[PacketRecord]:
         if syscall == "shutdown" and event.get("result", 0) != 0:
             return []
+        packets = self._flush_all(flow, time_float)
         if not flow.handshake_done:
-            # Ensure the connection exists before FIN.
-            handshake_ts = time_float
-            packets = self._emit_handshake(flow, handshake_ts)
-        else:
-            packets = []
+            packets.extend(self._emit_handshake(flow, time_float))
         if side in flow.fin_sent:
             return packets
         seq, ack = self._seq_ack_for(flow, side)
@@ -236,9 +261,10 @@ class UnixTCPManager:
             time_float,
         )
         self._advance_after_fin(flow, side)
+        self._validate_flow(flow, "fin")
         packets.append(fin_packet)
         peer = Flow.opposite(side)
-        ack_time = time_float + 0.00005
+        ack_time = max(time_float + 0.00005, time_float)
         peer_seq, peer_ack = self._seq_ack_for(flow, peer)
         ack_packet = self._build_record(
             flow,
@@ -253,18 +279,131 @@ class UnixTCPManager:
         flow.fin_sent.add(side)
         return packets
 
+    def _flush_all(self, flow: Flow, reference_ts: float) -> List[PacketRecord]:
+        order: List[Tuple[float, str]] = []
+        for side in ("A", "B"):
+            if flow.pending_data[side]:
+                start_ts = flow.pending_start[side]
+                order.append((start_ts if start_ts is not None else reference_ts, side))
+        order.sort(key=lambda item: item[0])
+        packets: List[PacketRecord] = []
+        for _, side in order:
+            packets.extend(self._flush_buffer(flow, side, reference_ts))
+        return packets
+
+    def _flush_if_timeout(self, flow: Flow, side: str, ts: float) -> List[PacketRecord]:
+        last_ts = flow.last_event_ts[side]
+        if not flow.pending_data[side] or last_ts is None:
+            return []
+        if ts - last_ts > self._coalesce_window:
+            return self._flush_buffer(flow, side, ts)
+        return []
+
+    def _flush_buffer(self, flow: Flow, side: str, reference_ts: float) -> List[PacketRecord]:
+        buf = flow.pending_data[side]
+        if not buf:
+            return []
+        flush_ts = flow.pending_start[side]
+        if flush_ts is None:
+            flush_ts = reference_ts
+        data = bytes(buf)
+        buf.clear()
+        flow.pending_start[side] = None
+        flow.last_event_ts[side] = None
+        return self._emit_payload(flow, side, data, flush_ts)
+
+    def _emit_payload(self, flow: Flow, side: str, data: bytes, ts: float) -> List[PacketRecord]:
+        packets: List[PacketRecord] = []
+        if not flow.handshake_done:
+            packets.extend(self._emit_handshake(flow, ts))
+        packets.extend(self._maybe_seed(flow, ts))
+        seq, ack = self._seq_ack_for(flow, side)
+        tcp_flags = TCP_FLAG_PSH | TCP_FLAG_ACK
+        packets.append(
+            self._build_record(
+                flow,
+                side,
+                seq,
+                ack,
+                tcp_flags,
+                data,
+                ts,
+            )
+        )
+        self._advance_after_payload(flow, side, len(data))
+        self._validate_flow(flow, f"payload-{side}")
+        return packets
+
+    def _maybe_seed(self, flow: Flow, first_payload_ts: float) -> List[PacketRecord]:
+        packets: List[PacketRecord] = []
+        if self._seed_http2 and not flow.seed_http2_emitted:
+            packets.extend(self._seed_http2_frames(flow, first_payload_ts))
+        if self._seed_grpc and not flow.seed_grpc_emitted:
+            packets.extend(self._seed_grpc_frame(flow, first_payload_ts))
+        return packets
+
+    def _seed_http2_frames(self, flow: Flow, first_payload_ts: float) -> List[PacketRecord]:
+        packets: List[PacketRecord] = []
+        client_time = max(0.0, first_payload_ts - 0.00009)
+        server_time = max(client_time + 0.00002, first_payload_ts - 0.00006)
+        seq_a, ack_a = self._seq_ack_for(flow, "A")
+        packets.append(
+            self._build_record(
+                flow,
+                "A",
+                seq_a,
+                ack_a,
+                TCP_FLAG_PSH | TCP_FLAG_ACK,
+                HTTP2_CLIENT_SEED,
+                client_time,
+            )
+        )
+        self._advance_after_payload(flow, "A", len(HTTP2_CLIENT_SEED))
+        self._validate_flow(flow, "seed-http2-client")
+        seq_b, ack_b = self._seq_ack_for(flow, "B")
+        packets.append(
+            self._build_record(
+                flow,
+                "B",
+                seq_b,
+                ack_b,
+                TCP_FLAG_PSH | TCP_FLAG_ACK,
+                HTTP2_SETTINGS_ACK_FRAME,
+                server_time,
+            )
+        )
+        self._advance_after_payload(flow, "B", len(HTTP2_SETTINGS_ACK_FRAME))
+        self._validate_flow(flow, "seed-http2-server")
+        flow.seed_http2_emitted = True
+        return packets
+
+    def _seed_grpc_frame(self, flow: Flow, first_payload_ts: float) -> List[PacketRecord]:
+        packets: List[PacketRecord] = []
+        headers_time = max(0.0, first_payload_ts - 0.00003)
+        seq_a, ack_a = self._seq_ack_for(flow, "A")
+        packets.append(
+            self._build_record(
+                flow,
+                "A",
+                seq_a,
+                ack_a,
+                TCP_FLAG_PSH | TCP_FLAG_ACK,
+                GRPC_HEADERS_FRAME,
+                headers_time,
+            )
+        )
+        self._advance_after_payload(flow, "A", len(GRPC_HEADERS_FRAME))
+        self._validate_flow(flow, "seed-grpc")
+        flow.seed_grpc_emitted = True
+        return packets
+
     def _emit_handshake(self, flow: Flow, first_payload_ts: float) -> List[PacketRecord]:
         if flow.handshake_done:
             return []
         syn_time = max(0.0, first_payload_ts - 0.0003)
-        synack_candidate = first_payload_ts - 0.0002
-        synack_time = synack_candidate if synack_candidate > syn_time else syn_time + 0.00005
-        ack_candidate = first_payload_ts - 0.0001
-        ack_time = ack_candidate if ack_candidate > synack_time else synack_time + 0.00005
-        if ack_time >= first_payload_ts:
-            ack_time = max(synack_time + 0.00001, first_payload_ts - 0.000001)
+        synack_time = max(syn_time + 0.00005, first_payload_ts - 0.0002)
+        ack_time = max(synack_time + 0.00005, first_payload_ts - 0.0001)
         packets: List[PacketRecord] = []
-        # SYN
         packets.append(
             self._build_record(
                 flow,
@@ -278,7 +417,6 @@ class UnixTCPManager:
         )
         flow.next_seq_a += 1
         flow.ack_from_b = flow.next_seq_a
-        # SYN-ACK
         packets.append(
             self._build_record(
                 flow,
@@ -292,7 +430,6 @@ class UnixTCPManager:
         )
         flow.next_seq_b += 1
         flow.ack_from_a = flow.next_seq_b
-        # ACK
         packets.append(
             self._build_record(
                 flow,
@@ -305,6 +442,7 @@ class UnixTCPManager:
             )
         )
         flow.handshake_done = True
+        self._validate_flow(flow, "handshake")
         return packets
 
     def _seq_ack_for(self, flow: Flow, side: str) -> Tuple[int, int]:
@@ -497,3 +635,19 @@ class UnixTCPManager:
         if usec < 0:
             usec = 0
         return sec, usec
+
+    def _validate_flow(self, flow: Flow, context: str) -> None:
+        if not flow.handshake_done:
+            return
+        expected_ack_from_a = flow.next_seq_b
+        expected_ack_from_b = flow.next_seq_a
+        if flow.ack_from_a != expected_ack_from_a or flow.ack_from_b != expected_ack_from_b:
+            self._logger.warning(
+                "TCP continuity warning for inode %s (%s): ack_from_a=%s expected=%s ack_from_b=%s expected=%s",
+                flow.inode,
+                context,
+                flow.ack_from_a,
+                expected_ack_from_a,
+                flow.ack_from_b,
+                expected_ack_from_b,
+            )

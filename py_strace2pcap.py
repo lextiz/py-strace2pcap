@@ -54,48 +54,79 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Convert strace output to PCAP')
     parser.add_argument('pcap_filename')
-    parser.add_argument('--unix-only', action='store_true',
-                        help='Emit only AF_UNIX events synthesised as TCP')
-    parser.add_argument('--unix-to-tcp', dest='unix_to_tcp', action='store_true',
-                        help='Synthesize TCP flows for UNIX stream sockets (default)')
-    parser.add_argument('--no-unix-to-tcp', dest='unix_to_tcp', action='store_false',
-                        help='Disable UNIX stream TCP synthesis')
-    parser.set_defaults(unix_to_tcp=True)
-    parser.add_argument('--linktype', choices=['raw', 'ether'], default='raw',
-                        help='PCAP link-layer type for AF_INET/AF_INET6 packets')
+
+    def _add_boolean_flag(flag: str, *, default: bool, enable_help: str, disable_help: str) -> None:
+        dest = flag.lstrip('-').replace('-', '_')
+        if hasattr(argparse, 'BooleanOptionalAction'):
+            parser.add_argument(
+                flag,
+                action=argparse.BooleanOptionalAction,
+                default=default,
+                help=enable_help,
+            )
+        else:  # pragma: no cover - Python <3.9 fallback
+            group = parser.add_mutually_exclusive_group()
+            group.add_argument(flag, dest=dest, action='store_true', help=enable_help)
+            group.add_argument(f"--no-{flag.lstrip('-')}", dest=dest, action='store_false', help=disable_help)
+            parser.set_defaults(**{dest: default})
+
+    _add_boolean_flag(
+        '--capture-unix-socket',
+        default=False,
+        enable_help='Enable synthetic TCP capture for AF_UNIX stream sockets',
+        disable_help='Disable synthetic TCP capture for AF_UNIX stream sockets',
+    )
+    _add_boolean_flag(
+        '--capture-net',
+        default=True,
+        enable_help='Enable capture of AF_INET/AF_INET6 sockets (default: enabled)',
+        disable_help='Disable capture of AF_INET/AF_INET6 sockets',
+    )
+    parser.add_argument(
+        '--seed-http2',
+        action='store_true',
+        default=False,
+        help='Seed UNIX TCP flows with the HTTP/2 client preface and SETTINGS frames',
+    )
+    parser.add_argument(
+        '--seed-grpc',
+        action='store_true',
+        default=False,
+        help='Seed UNIX TCP flows with a minimal gRPC HEADERS frame (implies HTTP/2 seeding)',
+    )
 
     args = parser.parse_args()
 
-    if args.unix_only and not args.unix_to_tcp:
-        parser.error('--unix-only requires UNIX TCP synthesis to be enabled')
+    if args.seed_grpc and not args.seed_http2:
+        parser.error('--seed-grpc requires --seed-http2')
 
-    unix_tcp_enabled = args.unix_to_tcp
-    if args.unix_only or unix_tcp_enabled:
-        linktype_value = 1
-        inet_linktype = 'ether'
-    else:
-        linktype_value = 101 if args.linktype == 'raw' else 1
-        inet_linktype = args.linktype
+    linktype_value = 1  # DLT_EN10MB
+    inet_linktype = 'ether'
 
     pktdump = RawPcapWriter(args.pcap_filename, linktype=linktype_value)
 
     strace_parser = StraceParser()
-    inet_packetizer = None if args.unix_only else StraceParser2Packet(linktype=inet_linktype)
-    unix_manager = UnixTCPManager() if unix_tcp_enabled else None
+    inet_packetizer = StraceParser2Packet(linktype=inet_linktype) if args.capture_net else None
+    unix_manager = None
+    if args.capture_unix_socket:
+        unix_manager = UnixTCPManager(
+            seed_http2=args.seed_http2,
+            seed_grpc=args.seed_grpc,
+        )
 
     for event in _iterate_events(strace_parser, sys.stdin):
         if not event:
             continue
         protocol = event.get('protocol')
         if protocol and protocol.startswith('UNIX'):
-            if not unix_tcp_enabled:
+            if not unix_manager:
                 continue
             if protocol != 'UNIX-STREAM':
                 continue
             for record in unix_manager.handle_event(event):
                 _write_record(pktdump, record)
             continue
-        if args.unix_only:
+        if not inet_packetizer:
             continue
         packet = inet_packetizer.process(event)
         if packet:
