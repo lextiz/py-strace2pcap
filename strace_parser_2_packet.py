@@ -1,10 +1,6 @@
 """Parse strace line to scapy packets."""
 
-from collections import deque
-
 from scapy.all import Ether, Dot1Q, IP, IPv6, TCP, UDP, Raw
-
-from pcap_synth import UnixFlowManager, UnixSynthConfig, build_packet
 
 
 class StraceParser2Packet():
@@ -19,21 +15,17 @@ class StraceParser2Packet():
     op_encode['sendto'] = 6
     op_encode['close'] = 7
 
-    def __init__(self, *, unix_config: UnixSynthConfig, linktype: str = 'ether'):
+    def __init__(self, *, linktype: str = 'ether'):
         self.sequence = {}
-        self.pending_packets = deque()
         self.linktype = linktype
-        self.unix_manager = UnixFlowManager(unix_config)
         self.ip_id = 0
 
     def has_split_cache(self):
         """ cheks is there split cache, but not implemented so False """
-        return bool(self.pending_packets)
+        return False
 
     def get_split_cache(self):
         """return next cached packet"""
-        if self.pending_packets:
-            return self.pending_packets.popleft()
         return False
 
     def encode_decimal2mac(self, enc):
@@ -168,12 +160,8 @@ class StraceParser2Packet():
         if not c:
             return False
 
-        unix_packets = self.unix_manager.handle_event(c)
-        for spec in unix_packets:
-            pkt = build_packet(spec, self.linktype, self._next_ip_id())
-            self.pending_packets.append(pkt)
-        if unix_packets:
-            return self.pending_packets.popleft()
+        if c.get('protocol', '').startswith('UNIX'):
+            return False
 
         if c.get('protocol') == "TCP":
             return self.generate_tcp_packet(c)

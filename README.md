@@ -44,24 +44,28 @@ start conversion from strace to pcap
 py_strace2pcap.py file_to_store.pcap < /tmp/straceSample
 ```
 
-## UNIX domain socket synthesis
+## UNIX domain sockets
 
-`py_strace2pcap.py` can synthesise TCP/UDP traffic for AF\_UNIX sockets that appear in
-the strace log. When `--unix-to-tcp` (default) is enabled the converter creates
-deterministic IPv4 endpoints and emits a TCP 3-way handshake followed by PSH/ACK
-segments for each observed `write()`/`read()` pair. UNIX datagram activity is
-mapped to UDP packets. This allows Wireshark to decode higher-layer plaintext
-protocols such as HTTP/2 or gRPC even when the underlying transport was a UNIX
-socket.
-
-The synthetic addressing can be customised:
+`py_strace2pcap.py` can export AF\_UNIX activity without pretending it was TCP.
+Pass `--unix-only` to generate a PCAP whose link-layer is `DLT_USER0` and whose
+frames contain `UXSO` records. Each record mirrors a single `read()`/`write()`
+operation observed in the strace log and stores the PID, FD, inode, direction,
+optional path metadata, and the raw payload bytes.
 
 ```console
-py_strace2pcap.py --unix-base-ip-a 10.10.0.1 --unix-base-ip-b 10.10.1.1 \
-  --unix-base-sport 35000 --unix-base-dport 45000 output.pcap < trace.log
+py_strace2pcap.py --unix-only output.pcap < trace.log
 ```
 
-Set `--no-unix-to-tcp` to disable synthesis and preserve the previous behaviour.
+Set `--no-include-unix-paths` to omit `sun_path` strings from the records if
+they contain sensitive data. The default is to embed both the local path and
+peer path (when present) before the captured payload.
+
+Wireshark, tshark, or tcpdump will treat the resulting PCAP as opaque USER0
+frames unless the included dissector is installed. Copy
+`extras/wireshark/uxso.lua` into your Wireshark plugins directory and restart
+the application to see structured UXSO dissections and payload bytes. Without
+`--unix-only` AF\_UNIX events are skipped and only AF\_INET/AF\_INET6 packets are
+emitted, preserving the traditional behaviour of the tool.
 
 ## Link-layer options
 
