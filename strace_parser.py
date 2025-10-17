@@ -390,23 +390,31 @@ class StraceParser():
         # if syscall is close, fd is closed, incrase fd_track for pid-fd key
         parsed['session'] = self.fd_track.get(track_key)
 
+        parsed['result'] = self._extract_result(unified_line)
+
         if parsed['syscall'] in self.syscalls_format['state']:
             parsed['payload'] = b''
-            parsed['result'] = self._extract_result(unified_line)
             self.fd_track.increase(track_key)
             return parsed
 
         payload = self.get_payload_chunk(parsed['syscall'], args)
 
         full_payload = self.bytes_code_payload(payload)
-        if len(full_payload) > self.scapy_max_payload:
-            parsed['payload'] = full_payload[:self.scapy_max_payload]
-            self.split_cache_packet = dict(parsed)
-            self.split_cache_packet['payload'] = full_payload[self.scapy_max_payload:]
-        else:
-            parsed['payload'] = full_payload
 
-        parsed['result'] = self._extract_result(unified_line)
+        result = parsed['result']
+        emit_len = 0
+        if isinstance(result, int) and result > 0:
+            emit_len = min(result, len(full_payload))
+
+        emit_payload = full_payload[:emit_len]
+
+        if emit_len > self.scapy_max_payload:
+            parsed['payload'] = emit_payload[:self.scapy_max_payload]
+            self.split_cache_packet = dict(parsed)
+            self.split_cache_packet['payload'] = emit_payload[self.scapy_max_payload:]
+        else:
+            parsed['payload'] = emit_payload
+
         return parsed
 
     def process(self, pline):

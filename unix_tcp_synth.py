@@ -219,14 +219,17 @@ class UnixTCPManager:
         payload: bytes,
         timestamp: float,
     ) -> List[PacketRecord]:
-        if not isinstance(result, int) or result <= 0:
+        if not isinstance(result, int):
+            return []
+        if result <= 0:
             return []
         if not isinstance(payload, (bytes, bytearray)):
             return []
-        data = bytes(payload[:result])
-        if not data:
+        emit_len = min(result, len(payload))
+        if emit_len <= 0:
             return []
-        flow.in_bytes[side] += len(data)
+        data = bytes(payload[:emit_len])
+        flow.in_bytes[side] += emit_len
         buf = flow.buffers[side]
         if not buf:
             flow.buffer_start[side] = timestamp

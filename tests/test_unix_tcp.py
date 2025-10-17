@@ -197,6 +197,48 @@ def test_residual_bytes_flushed_on_close(tmp_path):
     assert payload in payloads
 
 
+def test_retval_limits_payload(tmp_path):
+    pcap_path = tmp_path / 'retval.pcap'
+    write_payload = b'ABCDEF'
+    read_payload = b'GHIJKL'
+
+    write_escaped = _escape(write_payload)
+    read_escaped = _escape(read_payload)
+
+    strace_text = '\n'.join([
+        f'2024 1760606087.450000 write(33<UNIX-STREAM:[1357]>, "{write_escaped}", {len(write_payload)}) = 3',
+        f'2024 1760606087.450300 read(33<UNIX-STREAM:[1357]>, "{read_escaped}", {len(read_payload)}) = 2',
+        '2024 1760606087.450600 close(33<UNIX-STREAM:[1357]>) = 0',
+        ''
+    ])
+
+    cmd = [
+        sys.executable,
+        'py_strace2pcap.py',
+        '--capture-unix-socket',
+        '--no-capture-net',
+        str(pcap_path),
+    ]
+    subprocess.run(cmd, input=strace_text, text=True, check=True)
+
+    packets = _read_pcap(pcap_path)
+    data_packets = [pkt for pkt in packets if _tcp_flags(pkt[2]) & TCP_FLAG_PSH]
+
+    client_payloads = [
+        _tcp_payload(pkt[2])
+        for pkt in data_packets
+        if _tcp_ports(pkt[2])[1] == 50051
+    ]
+    server_payloads = [
+        _tcp_payload(pkt[2])
+        for pkt in data_packets
+        if _tcp_ports(pkt[2])[0] == 50051
+    ]
+
+    assert client_payloads and client_payloads[0] == b'ABC'
+    assert any(payload == b'GH' for payload in server_payloads)
+
+
 def test_no_checksum_flag(tmp_path):
     pcap_path = tmp_path / 'no_checksum.pcap'
     frame = b'\x00\x00\x01\x00\x01\x00\x00\x00\x01A'
