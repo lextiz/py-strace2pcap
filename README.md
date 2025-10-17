@@ -47,20 +47,15 @@ py_strace2pcap.py file_to_store.pcap < /tmp/straceSample
 ## UNIX domain sockets
 
 By default the converter emits the original AF_INET/AF_INET6 packets only.
-Pass `--capture-unix-socket` to synthesise realistic Ethernet/IP/TCP flows for
-UNIX stream sockets. Each inode is mapped to a deterministic 5-tuple
+Pass `--capture-unix-socket` to synthesise Ethernet/IP/TCP flows for UNIX
+stream sockets. Each inode is mapped to a deterministic 5-tuple
 (`10.0.0.X:ephemeral → 10.0.1.X:50051`) so Wireshark can decode HTTP/2 and
-gRPC traffic automatically. The synthesiser emits a three-way handshake once
-per flow, coalesces adjacent writes from the same direction, and generates
-FIN/ACK pairs when `close()`/`shutdown()` are observed. Disable AF_INET/6
-processing with `--no-capture-net` when you only need the UNIX side of the
-conversation.
-
-The UNIX pipeline buffers outgoing bytes until a full HTTP/2 frame is
-available so Wireshark always receives frame-aligned TCP segments. Any stray
-data encountered during re-synchronisation is preserved and emitted as an
-"opaque" TCP payload before the next aligned frame, and the final
-`close()`/EOF flush guarantees that no bytes are dropped.
+gRPC traffic. The synthesiser emits a single handshake per flow, keeps FIN/ACK
+pairs in sync with the observed `close()`/`shutdown()`, and buffers writes
+until complete HTTP/2 frames are available. During resynchronisation any stray
+bytes are forwarded as "opaque" TCP payloads so nothing is discarded. Disable
+AF_INET/6 processing with `--no-capture-net` when you only need the UNIX side
+of the conversation.
 
 ```console
 py_strace2pcap.py --capture-unix-socket --no-capture-net output.pcap < trace.log
@@ -72,20 +67,13 @@ capture starts mid-stream:
 * `--seed-http2` injects the HTTP/2 client preface and minimal SETTINGS/ACK
   frames before the first payload so Wireshark enables the HTTP/2 dissector
   automatically.
-* `--seed-grpc` (requires `--seed-http2`) controls optional gRPC bootstrapping.
-  Seeding is disabled by default.
-  Use `--seed-grpc auto` (or simply `--seed-grpc`) to inject the HEADERS frame
-  only after the parser sees real evidence of gRPC traffic (HTTP/2 DATA frames
-  with the five-byte gRPC prefix or HEADERS mentioning `content-type:
-  application/grpc`). Pass `--seed-grpc force` or `--seed-grpc force=/path` to
-  unconditionally add the seed frame and optionally override the default
-  placeholder RPC path.
+* `--seed-grpc` (requires `--seed-http2`) adds a placeholder gRPC HEADERS frame
+  once real traffic provides evidence (HTTP/2 DATA frames with the gRPC
+  five-byte prefix or HEADERS mentioning `content-type: application/grpc`).
 
-All synthesised TCP segments include fully-populated IPv4 and TCP checksums.
-Pass `--no-checksum` if you need the legacy zeroed checksum behaviour. The
-converter also keeps per-direction byte counters and logs any discrepancies
-between the bytes observed in strace and the bytes written to the PCAP so you
-can confirm that no payload was lost during framing or re-synchronisation.
+All synthesised TCP segments carry valid IPv4/TCP checksums. Per-direction byte
+accounting is logged to confirm that the emitted payload matches the strace
+return values.
 
 ## Link-layer options
 

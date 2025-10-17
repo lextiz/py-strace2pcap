@@ -6,7 +6,6 @@
     4) wireshark file_to_store.pcap """
 
 import inspect
-from typing import Optional, Tuple
 
 from scapy.all import RawPcapWriter
 
@@ -91,40 +90,14 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--seed-grpc',
-        nargs='?',
-        const='auto',
-        default='off',
-        metavar='MODE',
-        help='Seed UNIX TCP flows with a gRPC HEADERS frame (MODE: off, auto, force or force=/path)',
-    )
-    parser.add_argument(
-        '--no-checksum',
         action='store_true',
         default=False,
-        help='Disable TCP checksum calculation for synthetic UNIX flows',
+        help='Seed UNIX TCP flows with a gRPC HEADERS frame when evidence is observed (requires --seed-http2)',
     )
 
     args = parser.parse_args()
 
-    def _interpret_seed_grpc(raw: str) -> Tuple[str, Optional[str]]:
-        if raw is None:
-            raw = 'auto'
-        value = raw.strip()
-        lowered = value.lower()
-        if lowered == 'off':
-            return 'off', None
-        if lowered == 'auto':
-            return 'auto', None
-        if lowered == 'force':
-            return 'force', None
-        if lowered.startswith('force='):
-            path = value[len('force='):]
-            return 'force', path or None
-        parser.error(f"invalid --seed-grpc value: {value}")
-
-    seed_grpc_mode, seed_grpc_path = _interpret_seed_grpc(args.seed_grpc)
-
-    if seed_grpc_mode != 'off' and not args.seed_http2:
+    if args.seed_grpc and not args.seed_http2:
         parser.error('--seed-grpc requires --seed-http2')
 
     linktype_value = 1  # DLT_EN10MB
@@ -138,9 +111,7 @@ if __name__ == '__main__':
     if args.capture_unix_socket:
         unix_manager = UnixTCPManager(
             seed_http2=args.seed_http2,
-            seed_grpc_mode=seed_grpc_mode,
-            seed_grpc_path=seed_grpc_path,
-            no_checksum=args.no_checksum,
+            seed_grpc=args.seed_grpc,
         )
 
     for event in _iterate_events(strace_parser, sys.stdin):
