@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from unix_tcp_synth import GRPC_HEADERS_FRAME, HTTP2_CLIENT_SEED, HTTP2_SETTINGS_ACK_FRAME
+from unix_tcp_synth import HTTP2_CLIENT_SEED, HTTP2_SETTINGS_ACK_FRAME, build_grpc_headers_frame
 
 
 TCP_FLAG_PSH = 0x08
@@ -159,6 +159,7 @@ def test_unix_stream_seed_grpc(tmp_path):
         '--no-capture-net',
         '--seed-http2',
         '--seed-grpc',
+        'force',
         str(pcap_path),
     ]
     subprocess.run(cmd, input=strace_text, text=True, check=True)
@@ -166,7 +167,8 @@ def test_unix_stream_seed_grpc(tmp_path):
     packets = _read_pcap(pcap_path)
     payloads = [_tcp_payload(pkt[2]) for pkt in packets if _tcp_flags(pkt[2]) & TCP_FLAG_PSH]
 
-    assert any(payload == GRPC_HEADERS_FRAME for payload in payloads)
+    expected_seed = build_grpc_headers_frame()
+    assert any(payload == expected_seed for payload in payloads)
     assert server_frame in payloads
 
 
@@ -220,3 +222,33 @@ def test_no_checksum_flag(tmp_path):
     data_packets = [pkt for pkt in packets if _tcp_flags(pkt[2]) & TCP_FLAG_PSH]
     assert data_packets, 'expected data packet'
     assert _tcp_checksum(data_packets[0][2]) == 0
+
+
+def test_seed_grpc_auto_detects_data_frames(tmp_path):
+    pcap_path = tmp_path / 'seed_grpc_auto.pcap'
+    grpc_data = b'\x00\x00\x05\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00'
+    escaped = _escape(grpc_data)
+
+    strace_text = '\n'.join([
+        f'7777 1760606087.600000 write(31<UNIX-STREAM:[4242]>, "{escaped}", {len(grpc_data)}) = {len(grpc_data)}',
+        '7777 1760606087.600400 close(31<UNIX-STREAM:[4242]>) = 0',
+        ''
+    ])
+
+    cmd = [
+        sys.executable,
+        'py_strace2pcap.py',
+        '--capture-unix-socket',
+        '--no-capture-net',
+        '--seed-http2',
+        '--seed-grpc',
+        'auto',
+        str(pcap_path),
+    ]
+    subprocess.run(cmd, input=strace_text, text=True, check=True)
+
+    packets = _read_pcap(pcap_path)
+    payloads = [_tcp_payload(pkt[2]) for pkt in packets if _tcp_flags(pkt[2]) & TCP_FLAG_PSH]
+    expected_seed = build_grpc_headers_frame()
+    assert expected_seed in payloads
+    assert grpc_data in payloads

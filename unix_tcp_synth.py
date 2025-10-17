@@ -30,10 +30,15 @@ HTTP2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 HTTP2_CLIENT_SETTINGS_FRAME = b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
 HTTP2_SETTINGS_ACK_FRAME = b"\x00\x00\x00\x04\x01\x00\x00\x00\x00"
 HTTP2_CLIENT_SEED = HTTP2_PREFACE + HTTP2_CLIENT_SETTINGS_FRAME
-GRPC_HEADERS_BLOCK = bytes.fromhex(
-    "8386449462ba0642ce7a242d8bee2d9dcc42b1a0a99cf27f4186a0e41d139d095f8b1d75d0620d263d4c4d65644082497f864d833505b11f"
-)
-GRPC_HEADERS_FRAME = b"\x00\x00\x38\x01\x04\x00\x00\x00\x01" + GRPC_HEADERS_BLOCK
+DEFAULT_GRPC_PATH = "/placeholder.Service/Method"
+GRPC_HEADER_FIELDS = [
+    (":method", "POST"),
+    (":scheme", "http"),
+    (":path", DEFAULT_GRPC_PATH),
+    (":authority", "localhost"),
+    ("content-type", "application/grpc"),
+    ("te", "trailers"),
+]
 
 
 @dataclass
@@ -69,6 +74,10 @@ class Flow:
     preface_done: bool = False
     seed_http2_done: bool = False
     seed_grpc_done: bool = False
+    grpc_evidence: bool = False
+    in_bytes: Dict[str, int] = field(default_factory=lambda: {"A": 0, "B": 0})
+    out_bytes: Dict[str, int] = field(default_factory=lambda: {"A": 0, "B": 0})
+    account_logged: Dict[str, bool] = field(default_factory=lambda: {"A": False, "B": False})
 
     def owner_side(self, owner_key: Tuple[int, int, int]) -> str:
         if owner_key in self.owners:
@@ -94,7 +103,8 @@ class UnixTCPManager:
         base_sport: int = 30000,
         dst_port: int = 50051,
         seed_http2: bool = False,
-        seed_grpc: bool = False,
+        seed_grpc_mode: str = "off",
+        seed_grpc_path: Optional[str] = None,
         no_checksum: bool = False,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -107,7 +117,8 @@ class UnixTCPManager:
         self._next_index = 0
         self._ip_id = 0
         self._seed_http2 = seed_http2
-        self._seed_grpc = seed_grpc
+        self._seed_grpc_mode = seed_grpc_mode
+        self._seed_grpc_path = seed_grpc_path
         self._no_checksum = no_checksum
         self._logger = logger or logging.getLogger(__name__)
 
@@ -215,6 +226,7 @@ class UnixTCPManager:
         data = bytes(payload[:result])
         if not data:
             return []
+        flow.in_bytes[side] += len(data)
         buf = flow.buffers[side]
         if not buf:
             flow.buffer_start[side] = timestamp
@@ -276,11 +288,11 @@ class UnixTCPManager:
         if not buf:
             return packets
         start_ts = flow.buffer_start[side] or flow.last_event_ts[side] or 0.0
-        outputs: List[Tuple[bytes, bool, Optional[str]]] = []
+        outputs: List[Tuple[bytes, bool, Optional[str], Optional[Tuple[int, int, int, int]]]] = []
 
         while buf:
             if side == "A" and not flow.preface_done and len(buf) >= len(HTTP2_PREFACE) and buf.startswith(HTTP2_PREFACE):
-                outputs.append((bytes(buf[: len(HTTP2_PREFACE)]), False, "preface"))
+                outputs.append((bytes(buf[: len(HTTP2_PREFACE)]), False, "preface", None))
                 del buf[: len(HTTP2_PREFACE)]
                 flow.preface_done = True
                 continue
@@ -302,7 +314,7 @@ class UnixTCPManager:
                         flow.inode,
                         len(chunk),
                     )
-                    outputs.append((chunk, False, "opaque"))
+                    outputs.append((chunk, False, "opaque", None))
                 continue
 
             length, _, _, _ = parsed
@@ -312,22 +324,29 @@ class UnixTCPManager:
 
             frame = bytes(buf[:total])
             del buf[:total]
-            outputs.append((frame, True, None))
+            outputs.append((frame, True, None, parsed))
 
         if final and buf:
-            outputs.append((bytes(buf), False, "final"))
+            outputs.append((bytes(buf), False, "final", None))
             buf.clear()
 
         if not outputs:
+            if final:
+                self._log_accounting(flow, side)
             return packets
 
-        for idx, (payload, is_frame, reason) in enumerate(outputs):
+        for idx, (payload, is_frame, reason, meta) in enumerate(outputs):
             ts = max(start_ts + idx * TIMESTAMP_EPSILON, 0.0)
+            if is_frame and meta:
+                length, frame_type, flags, stream_id = meta
+                self._inspect_frame_for_grpc(flow, side, frame_type, flags, payload[9:], stream_id)
             packets.extend(
                 self._emit_payload(flow, side, payload, ts, is_frame=is_frame, reason=reason)
             )
 
         flow.buffer_start[side] = flow.last_event_ts[side] if buf else None
+        if final:
+            self._log_accounting(flow, side)
         return packets
 
     def _find_alignment(self, buf: bytearray) -> Optional[int]:
@@ -382,6 +401,7 @@ class UnixTCPManager:
 
         packets.extend(chunk_packets)
         flow.next_seq[side] += total_len
+        flow.out_bytes[side] += total_len
         if not is_frame:
             if reason == "preface":
                 self._logger.info(
@@ -446,10 +466,13 @@ class UnixTCPManager:
 
     def _maybe_seed(self, flow: Flow, ts: float) -> List[PacketRecord]:
         packets: List[PacketRecord] = []
-        if self._seed_http2 and not flow.preface_done:
+        if self._seed_http2 and not flow.seed_http2_done:
             packets.extend(self._emit_http2_seed(flow, ts))
-        if self._seed_grpc and not flow.seed_grpc_done:
-            packets.extend(self._emit_grpc_seed(flow, ts))
+        if self._seed_grpc_mode != "off" and not flow.seed_grpc_done:
+            if self._seed_grpc_mode == "force":
+                packets.extend(self._emit_grpc_seed(flow, ts))
+            elif self._seed_grpc_mode == "auto" and flow.grpc_evidence:
+                packets.extend(self._emit_grpc_seed(flow, ts))
         return packets
 
     def _emit_http2_seed(self, flow: Flow, ts: float) -> List[PacketRecord]:
@@ -471,6 +494,7 @@ class UnixTCPManager:
             )
         )
         flow.next_seq["A"] += len(HTTP2_CLIENT_SEED)
+        # Seed frames are synthetic and are not counted against byte accounting.
         packets.append(
             self._build_record(
                 flow,
@@ -514,6 +538,7 @@ class UnixTCPManager:
     def _emit_grpc_seed(self, flow: Flow, ts: float) -> List[PacketRecord]:
         packets: List[PacketRecord] = []
         seed_time = max(ts - TIMESTAMP_EPSILON, 0.0)
+        frame = build_grpc_headers_frame(self._seed_grpc_path or DEFAULT_GRPC_PATH)
         packets.append(
             self._build_record(
                 flow,
@@ -521,13 +546,61 @@ class UnixTCPManager:
                 flow.next_seq["A"],
                 flow.next_seq["B"],
                 TCP_FLAG_PSH | TCP_FLAG_ACK,
-                GRPC_HEADERS_FRAME,
+                frame,
                 seed_time,
             )
         )
-        flow.next_seq["A"] += len(GRPC_HEADERS_FRAME)
+        flow.next_seq["A"] += len(frame)
         flow.seed_grpc_done = True
         return packets
+
+    def _inspect_frame_for_grpc(
+        self,
+        flow: Flow,
+        side: str,
+        frame_type: int,
+        flags: int,
+        payload: bytes,
+        stream_id: int,
+    ) -> None:
+        if self._seed_grpc_mode == "off" or flow.seed_grpc_done:
+            return
+        if frame_type == 0 and len(payload) >= 5:
+            compressed_flag = payload[0]
+            msg_len = int.from_bytes(payload[1:5], "big")
+            if compressed_flag in (0, 1) and msg_len <= len(payload) - 5:
+                if msg_len <= MAX_HTTP2_FRAME_SIZE:
+                    if not flow.grpc_evidence:
+                        self._logger.info(
+                            "unix flow %s detected gRPC DATA evidence on stream %s", flow.inode, stream_id
+                        )
+                    flow.grpc_evidence = True
+        elif frame_type in (1, 9):
+            markers = (b"application/grpc", b"grpc-status", b"content-type", b"/Service/")
+            if any(marker in payload for marker in markers):
+                if not flow.grpc_evidence:
+                    self._logger.info(
+                        "unix flow %s detected gRPC HEADERS evidence on stream %s", flow.inode, stream_id
+                    )
+                flow.grpc_evidence = True
+
+    def _log_accounting(self, flow: Flow, side: str) -> None:
+        if flow.account_logged.get(side):
+            return
+        in_total = flow.in_bytes.get(side, 0)
+        out_total = flow.out_bytes.get(side, 0)
+        delta = in_total - out_total
+        level = logging.INFO if delta == 0 else logging.WARNING
+        self._logger.log(
+            level,
+            "unix flow %s side %s delivered %d/%d bytes (delta=%d)",
+            flow.inode,
+            side,
+            out_total,
+            in_total,
+            delta,
+        )
+        flow.account_logged[side] = True
 
     # ------------------------------------------------------------------
     def _build_record(
@@ -683,3 +756,41 @@ def _tcp_checksum(src_ip: str, dst_ip: str, header: bytes, payload: bytes) -> in
         + struct.pack("!BBH", 0, 6, len(header) + len(payload))
     )
     return _checksum(pseudo + header + payload)
+
+
+def _hpack_encode_integer(value: int, prefix_bits: int) -> bytes:
+    max_prefix_value = (1 << prefix_bits) - 1
+    if value < max_prefix_value:
+        return bytes([value])
+    out = bytearray([max_prefix_value])
+    value -= max_prefix_value
+    while value >= 128:
+        out.append((value % 128) + 128)
+        value //= 128
+    out.append(value)
+    return bytes(out)
+
+
+def _hpack_encode_string(data: str) -> bytes:
+    encoded = data.encode("utf-8")
+    length_bytes = _hpack_encode_integer(len(encoded), 7)
+    if length_bytes:
+        length_bytes = bytes([length_bytes[0] & 0x7F]) + length_bytes[1:]
+    return length_bytes + encoded
+
+
+def build_grpc_headers_frame(path: str = DEFAULT_GRPC_PATH) -> bytes:
+    if not path:
+        path = DEFAULT_GRPC_PATH
+    if not path.startswith("/"):
+        path = "/" + path
+    fields = GRPC_HEADER_FIELDS.copy()
+    fields[2] = (":path", path)
+    block = bytearray()
+    for name, value in fields:
+        block.append(0x40)
+        block.extend(_hpack_encode_string(name))
+        block.extend(_hpack_encode_string(value))
+    length = len(block)
+    header = length.to_bytes(3, "big") + b"\x01\x04" + (1).to_bytes(4, "big")
+    return header + bytes(block)

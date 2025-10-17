@@ -72,12 +72,20 @@ capture starts mid-stream:
 * `--seed-http2` injects the HTTP/2 client preface and minimal SETTINGS/ACK
   frames before the first payload so Wireshark enables the HTTP/2 dissector
   automatically.
-* `--seed-grpc` (requires `--seed-http2`) adds a small HEADERS frame on stream 1
-  with gRPC-friendly pseudo-headers so the gRPC dissector activates even when
-  the real request headers were not captured.
+* `--seed-grpc` (requires `--seed-http2`) controls optional gRPC bootstrapping.
+  Seeding is disabled by default.
+  Use `--seed-grpc auto` (or simply `--seed-grpc`) to inject the HEADERS frame
+  only after the parser sees real evidence of gRPC traffic (HTTP/2 DATA frames
+  with the five-byte gRPC prefix or HEADERS mentioning `content-type:
+  application/grpc`). Pass `--seed-grpc force` or `--seed-grpc force=/path` to
+  unconditionally add the seed frame and optionally override the default
+  placeholder RPC path.
 
 All synthesised TCP segments include fully-populated IPv4 and TCP checksums.
-Pass `--no-checksum` if you need the legacy zeroed checksum behaviour.
+Pass `--no-checksum` if you need the legacy zeroed checksum behaviour. The
+converter also keeps per-direction byte counters and logs any discrepancies
+between the bytes observed in strace and the bytes written to the PCAP so you
+can confirm that no payload was lost during framing or re-synchronisation.
 
 ## Link-layer options
 
