@@ -1,5 +1,7 @@
 """ strace -o /tmp/<file> -f -yy -ttt -xx -T parser """
 
+import re
+
 
 class FileDescriptorTracker():
     """ pid-fd tracker helper class """
@@ -260,15 +262,21 @@ class StraceParser():
         return [second_ip, second_port, first_ip, first_port]
 
     def bytes_code_payload(self, line_payload):
-        """ convert payload to bytes code """
-        # strace hex code \xab to 0xab
-        hex_payload = ",0x".join(line_payload.split('\\x'))[1:]
-        # from 0xAB coded payload, create bytes stored payload
-        p = []
-        for i in hex_payload.split(','):
-            if i:
-                p.append(int(i, 16))
-        return bytes(p)
+        r"""Convert payload to bytes, ignoring malformed hex escapes.
+
+        strace with the ``-xx`` flag emits payload bytes as ``\xHH``
+        sequences.  Occasionally, we encounter truncated escapes like
+        ``\x`` without any hex digits (for example when the output is
+        cut short).  The previous implementation tried to split the
+        string manually which resulted in ``int('0x', 16)`` raising a
+        ``ValueError`` when such a malformed escape was present.  We
+        now use a regular expression to extract only well-formed
+        ``\xHH`` sequences and ignore the malformed ones so that the
+        parser can continue processing the trace.
+        """
+
+        hex_bytes = re.findall(r"\\x([0-9a-fA-F]{2})", line_payload)
+        return bytes(int(byte, 16) for byte in hex_bytes)
 
     def _extract_result(self, unified_line):
         """Return the syscall result (retval) or None."""
@@ -315,7 +323,10 @@ class StraceParser():
             parsed['direction_out'] = False
 
         parsed['fd'] = int(args[2].split('(')[1].split('<')[0])
-        parsed['time'] = args[1]
+        try:
+            parsed['time'] = float(args[1])
+        except ValueError:
+            parsed['time'] = 0.0
 
         # start tracking first occurrence of pid-fd pair
         track_key = f"{parsed['pid']}-{parsed['fd']}"
