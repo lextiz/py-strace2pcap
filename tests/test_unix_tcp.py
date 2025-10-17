@@ -5,11 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from unix_tcp_synth import (  # type: ignore  # pylint: disable=import-error
-    GRPC_HEADERS_FRAME,
-    HTTP2_CLIENT_SEED,
-    HTTP2_SETTINGS_ACK_FRAME,
-)
+from grpc_seed import GRPC_HEADERS_FRAME, HTTP2_CLIENT_SEED, HTTP2_SETTINGS_ACK_FRAME  # type: ignore  # pylint: disable=import-error
 
 TCP_FLAG_PSH = 0x08
 TCP_FLAG_FIN = 0x01

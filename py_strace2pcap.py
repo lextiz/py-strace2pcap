@@ -106,7 +106,7 @@ if __name__ == '__main__':
     pktdump = RawPcapWriter(args.pcap_filename, linktype=linktype_value)
 
     strace_parser = StraceParser()
-    inet_packetizer = StraceParser2Packet(linktype=inet_linktype) if args.capture_net else None
+    inet_packetizer = StraceParser2Packet() if args.capture_net else None
     unix_manager = None
     if args.capture_unix_socket:
         unix_manager = UnixTCPManager(
